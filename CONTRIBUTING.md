@@ -34,7 +34,7 @@ Feature suggestions are welcome! Please:
 
 1. **Fork and Clone**
    ```bash
-   git clone https://github.com/yourusername/smart-ai-scraper.git
+   git clone https://github.com/maidulcu/smart-ai-scraper.git
    cd smart-ai-scraper
    ```
 
@@ -45,7 +45,7 @@ Feature suggestions are welcome! Please:
 
 3. **Set Up Development Environment**
    ```bash
-   pip install -r requirements.txt
+   pip install -r requirements.txt -r requirements-dev.txt
    pip install -e .
    playwright install chromium
    python -m spacy download en_core_web_sm

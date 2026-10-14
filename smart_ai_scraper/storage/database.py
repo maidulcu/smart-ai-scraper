@@ -3,27 +3,36 @@ Database storage layer supporting MongoDB and PostgreSQL
 """
 
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from abc import ABC, abstractmethod
+import json
 from loguru import logger
 
 try:
     from pymongo import MongoClient
-    from pymongo.collection import Collection
     MONGODB_AVAILABLE = True
 except ImportError:
     MONGODB_AVAILABLE = False
 
 try:
     from sqlalchemy import create_engine, Column, Integer, String, DateTime, JSON, Text
-    from sqlalchemy.ext.declarative import declarative_base
-    from sqlalchemy.orm import sessionmaker, Session
+    from sqlalchemy.engine import URL
+    from sqlalchemy.orm import declarative_base, sessionmaker, Session
     POSTGRES_AVAILABLE = True
     Base = declarative_base()
 except ImportError:
     POSTGRES_AVAILABLE = False
 
 from ..core.config import settings
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _json_safe(value: Any) -> Any:
+    """Round-trip through JSON so datetimes and other objects fit a JSON column"""
+    return json.loads(json.dumps(value, default=str))
 
 
 class StorageBackend(ABC):
@@ -35,7 +44,13 @@ class StorageBackend(ABC):
         pass
 
     @abstractmethod
-    def find(self, collection: str, query: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def find(
+        self,
+        collection: str,
+        query: Dict[str, Any],
+        limit: Optional[int] = None,
+        newest_first: bool = False,
+    ) -> List[Dict[str, Any]]:
         """Find documents matching query"""
         pass
 
@@ -73,17 +88,28 @@ class MongoDBStorage(StorageBackend):
 
     def save(self, collection: str, data: Dict[str, Any]) -> str:
         """Save data to MongoDB"""
-        # Add timestamp
-        if "created_at" not in data:
-            data["created_at"] = datetime.utcnow()
+        # Copy so the caller's dict doesn't gain a non-JSON-serializable ObjectId
+        data = dict(data)
+        data.setdefault("created_at", _utcnow())
 
         result = self.db[collection].insert_one(data)
         logger.debug(f"Saved document to {collection}: {result.inserted_id}")
         return str(result.inserted_id)
 
-    def find(self, collection: str, query: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def find(
+        self,
+        collection: str,
+        query: Dict[str, Any],
+        limit: Optional[int] = None,
+        newest_first: bool = False,
+    ) -> List[Dict[str, Any]]:
         """Find documents in MongoDB"""
-        results = list(self.db[collection].find(query))
+        cursor = self.db[collection].find(query)
+        if newest_first:
+            cursor = cursor.sort("created_at", -1)
+        if limit:
+            cursor = cursor.limit(limit)
+        results = list(cursor)
         # Convert ObjectId to string
         for result in results:
             if "_id" in result:
@@ -99,8 +125,7 @@ class MongoDBStorage(StorageBackend):
 
     def update(self, collection: str, query: Dict[str, Any], data: Dict[str, Any]) -> bool:
         """Update documents in MongoDB"""
-        # Add update timestamp
-        data["updated_at"] = datetime.utcnow()
+        data = {**data, "updated_at": _utcnow()}
 
         result = self.db[collection].update_many(query, {"$set": data})
         logger.debug(f"Updated {result.modified_count} documents in {collection}")
@@ -128,12 +153,14 @@ if POSTGRES_AVAILABLE:
         url = Column(Text, nullable=True)
         title = Column(Text, nullable=True)
         content = Column(Text, nullable=True)
-        metadata = Column(JSON, nullable=True)
+        # "metadata" is reserved by SQLAlchemy's declarative API, so map the
+        # attribute under a different name while keeping the column name
+        meta = Column("metadata", JSON, nullable=True)
         entities = Column(JSON, nullable=True)
         structured_data = Column(JSON, nullable=True)
         raw_data = Column(JSON, nullable=True)
-        created_at = Column(DateTime, default=datetime.utcnow)
-        updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+        created_at = Column(DateTime(timezone=True), default=_utcnow)
+        updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
 
 
 class PostgreSQLStorage(StorageBackend):
@@ -143,7 +170,16 @@ class PostgreSQLStorage(StorageBackend):
         if not POSTGRES_AVAILABLE:
             raise ImportError("sqlalchemy not installed. Install with: pip install sqlalchemy psycopg2-binary")
 
-        self.engine = create_engine(settings.database.get_postgres_url())
+        db = settings.database
+        url = URL.create(
+            "postgresql",
+            username=db.postgres_user,
+            password=db.postgres_password,
+            host=db.postgres_host,
+            port=db.postgres_port,
+            database=db.postgres_db,
+        )
+        self.engine = create_engine(url, pool_pre_ping=True)
         Base.metadata.create_all(self.engine)
         self.SessionLocal = sessionmaker(bind=self.engine)
         logger.info(f"Connected to PostgreSQL: {settings.database.postgres_db}")
@@ -158,10 +194,10 @@ class PostgreSQLStorage(StorageBackend):
                 url=data.get("url"),
                 title=data.get("title"),
                 content=data.get("content"),
-                metadata=data.get("metadata"),
+                meta=data.get("metadata"),
                 entities=data.get("entities"),
                 structured_data=data.get("structured_data"),
-                raw_data=data,
+                raw_data=_json_safe(data),
             )
 
             session.add(record)
@@ -177,7 +213,13 @@ class PostgreSQLStorage(StorageBackend):
         finally:
             session.close()
 
-    def find(self, collection: str, query: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def find(
+        self,
+        collection: str,
+        query: Dict[str, Any],
+        limit: Optional[int] = None,
+        newest_first: bool = False,
+    ) -> List[Dict[str, Any]]:
         """Find records in PostgreSQL"""
         session: Session = self.SessionLocal()
 
@@ -189,16 +231,27 @@ class PostgreSQLStorage(StorageBackend):
                 q = q.filter(ScrapedData.url == query["url"])
             if "title" in query:
                 q = q.filter(ScrapedData.title.like(f"%{query['title']}%"))
+            unsupported = set(query) - {"url", "title"}
+            if unsupported:
+                logger.warning(f"PostgreSQL backend ignores query fields: {sorted(unsupported)}")
+
+            if newest_first:
+                q = q.order_by(ScrapedData.created_at.desc(), ScrapedData.id.desc())
+            if limit:
+                q = q.limit(limit)
 
             results = []
             for record in q.all():
                 results.append({
+                    # Extracted fields (price, author, ...) only live in raw_data,
+                    # so surface them at the top level like the MongoDB backend
+                    **(record.raw_data or {}),
                     "id": record.id,
                     "collection": record.collection,
                     "url": record.url,
                     "title": record.title,
                     "content": record.content,
-                    "metadata": record.metadata,
+                    "metadata": record.meta,
                     "entities": record.entities,
                     "structured_data": record.structured_data,
                     "raw_data": record.raw_data,
@@ -213,7 +266,7 @@ class PostgreSQLStorage(StorageBackend):
 
     def find_one(self, collection: str, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Find one record in PostgreSQL"""
-        results = self.find(collection, query)
+        results = self.find(collection, query, limit=1)
         return results[0] if results else None
 
     def update(self, collection: str, query: Dict[str, Any], data: Dict[str, Any]) -> bool:
@@ -226,15 +279,19 @@ class PostgreSQLStorage(StorageBackend):
             if "url" in query:
                 q = q.filter(ScrapedData.url == query["url"])
 
-            count = q.update({
-                "title": data.get("title"),
-                "content": data.get("content"),
-                "metadata": data.get("metadata"),
-                "entities": data.get("entities"),
-                "structured_data": data.get("structured_data"),
-                "raw_data": data.get("raw_data"),
-                "updated_at": datetime.utcnow(),
-            })
+            # Only touch the fields that were provided instead of nulling the rest
+            columns = {
+                "title": ScrapedData.title,
+                "content": ScrapedData.content,
+                "metadata": ScrapedData.meta,
+                "entities": ScrapedData.entities,
+                "structured_data": ScrapedData.structured_data,
+                "raw_data": ScrapedData.raw_data,
+            }
+            values = {columns[k]: v for k, v in data.items() if k in columns}
+            values[ScrapedData.updated_at] = _utcnow()
+
+            count = q.update(values, synchronize_session=False)
 
             session.commit()
             logger.debug(f"Updated {count} records in {collection}")
@@ -293,9 +350,15 @@ class DatabaseManager:
         """Save data"""
         return self.backend.save(collection, data)
 
-    def find(self, collection: str, query: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+    def find(
+        self,
+        collection: str,
+        query: Optional[Dict[str, Any]] = None,
+        limit: Optional[int] = None,
+        newest_first: bool = False,
+    ) -> List[Dict[str, Any]]:
         """Find documents"""
-        return self.backend.find(collection, query or {})
+        return self.backend.find(collection, query or {}, limit=limit, newest_first=newest_first)
 
     def find_one(self, collection: str, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Find one document"""

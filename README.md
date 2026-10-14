@@ -15,7 +15,7 @@ An AI-powered open-source web scraper with advanced features for handling dynami
 
 ## Tech Stack
 
-- **Backend**: Python 3.8+
+- **Backend**: Python 3.9+
 - **Headless Browser**: Playwright (Chromium, Firefox, WebKit)
 - **AI/ML**: spaCy for NER, optional Transformers support
 - **Task Queue**: Celery with Redis
@@ -26,7 +26,7 @@ An AI-powered open-source web scraper with advanced features for handling dynami
 
 ### Prerequisites
 
-- Python 3.8 or higher
+- Python 3.9 or higher
 - Redis (for distributed scraping)
 - MongoDB or PostgreSQL (for data storage)
 
@@ -34,7 +34,7 @@ An AI-powered open-source web scraper with advanced features for handling dynami
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/smart-ai-scraper.git
+git clone https://github.com/maidulcu/smart-ai-scraper.git
 cd smart-ai-scraper
 
 # Install dependencies
@@ -203,6 +203,7 @@ MIN_DELAY=1
 MAX_DELAY=3
 USER_AGENT_ROTATION=true
 PROXY_ENABLED=false
+PROXY_LIST=  # comma-separated, e.g. http://proxy1:8080,http://proxy2:8080
 ```
 
 ### Rate Limiting
@@ -259,7 +260,7 @@ redis-server
 
 ### Start Celery Worker
 ```bash
-celery -A smart_ai_scraper.tasks.celery_app worker --loglevel=info
+celery -A smart_ai_scraper.tasks.celery_app worker -Q scraping,celery --loglevel=info
 ```
 
 ### Submit Tasks
@@ -375,8 +376,8 @@ This tool is for educational and research purposes. Users are responsible for:
 
 ## Support
 
-- Issues: https://github.com/yourusername/smart-ai-scraper/issues
-- Documentation: https://github.com/yourusername/smart-ai-scraper/wiki
+- Issues: https://github.com/maidulcu/smart-ai-scraper/issues
+- Documentation: https://github.com/maidulcu/smart-ai-scraper/wiki
 - Examples: See `examples/` directory
 
 ## Roadmap
@@ -387,7 +388,7 @@ This tool is for educational and research purposes. Users are responsible for:
 - [ ] Cloud deployment guides (AWS, GCP, Azure)
 - [ ] Web UI for scraper management
 - [ ] More specialized extractors
-- [ ] Proxy rotation support
+- [x] Basic proxy support (random proxy from `PROXY_LIST` per browser session)
 - [ ] Session management
 - [ ] Cookie handling improvements
 

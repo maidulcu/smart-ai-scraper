@@ -3,8 +3,11 @@ Main Smart Scraper class integrating all components
 """
 
 import asyncio
+import re
+from collections import deque
 from typing import Dict, Any, Optional, List
 from pathlib import Path
+from urllib.parse import urlparse, urljoin, urldefrag
 from loguru import logger
 
 from .browser import BrowserManager
@@ -43,6 +46,14 @@ class SmartScraper:
 
         self.ethical_scraper = EthicalScraper()
         self.extractor = AIExtractor()
+
+    def _extract(self, html: str, extractor_type: str) -> Optional[Dict[str, Any]]:
+        """Run the extractor matching extractor_type"""
+        if extractor_type == "product":
+            return self.extractor.extract_product_info(html)
+        if extractor_type == "article":
+            return self.extractor.extract_article_info(html)
+        return self.extractor.extract_from_html(html)
 
     async def scrape(
         self,
@@ -91,7 +102,11 @@ class SmartScraper:
         ) as browser:
             try:
                 # Navigate to URL
-                await browser.navigate(url)
+                response = await browser.navigate(url)
+                if response is not None:
+                    result["status_code"] = response.status
+                    if response.status >= 400:
+                        raise RuntimeError(f"HTTP {response.status} for {url}")
 
                 # Wait for selector if specified
                 if wait_for_selector:
@@ -108,20 +123,14 @@ class SmartScraper:
 
                 # Take screenshot if requested
                 if take_screenshot:
-                    screenshot_path = (
-                        Path(settings.storage.screenshots_dir)
-                        / f"{self._sanitize_filename(url)}.png"
-                    )
+                    screenshots_dir = Path(settings.storage.screenshots_dir)
+                    screenshots_dir.mkdir(parents=True, exist_ok=True)
+                    screenshot_path = screenshots_dir / f"{self._sanitize_filename(url)}.png"
                     await browser.screenshot(str(screenshot_path))
                     result["screenshot"] = str(screenshot_path)
 
                 # Extract data based on type
-                if extractor_type == "product":
-                    extracted_data = self.extractor.extract_product_info(html)
-                elif extractor_type == "article":
-                    extracted_data = self.extractor.extract_article_info(html)
-                else:  # general
-                    extracted_data = self.extractor.extract_from_html(html)
+                extracted_data = self._extract(html, extractor_type)
 
                 if extracted_data:
                     result.update(extracted_data)
@@ -129,16 +138,10 @@ class SmartScraper:
 
                 # Save to database if requested
                 if save_to_db and extracted_data:
-                    db = DatabaseManager()
-                    try:
-                        # Add URL to data
-                        extracted_data["url"] = url
-
-                        doc_id = db.save(collection, extracted_data)
-                        result["db_id"] = doc_id
-                        logger.info(f"Saved to database: {doc_id}")
-                    finally:
-                        db.close()
+                    with DatabaseManager() as db:
+                        doc_id = db.save(collection, {**extracted_data, "url": url})
+                    result["db_id"] = doc_id
+                    logger.info(f"Saved to database: {doc_id}")
 
                 logger.info(f"Successfully scraped {url}")
 
@@ -225,91 +228,85 @@ class SmartScraper:
         Returns:
             List of scraped data dictionaries
         """
-        from urllib.parse import urlparse, urljoin
-
+        start_url = urldefrag(start_url)[0]
         visited = set()
-        to_visit = [(start_url, 0)]  # (url, depth)
+        seen = {start_url}  # everything ever queued, for O(1) dedupe
+        to_visit = deque([(start_url, 0)])  # (url, depth)
         results = []
 
         start_domain = urlparse(start_url).netloc
+        db = DatabaseManager() if save_to_db else None
 
-        async with BrowserManager(
-            headless=self.headless,
-            browser_type=self.browser_type,
-            proxy=self.proxy,
-        ) as browser:
-            while to_visit and len(visited) < max_pages:
-                url, depth = to_visit.pop(0)
+        try:
+            async with BrowserManager(
+                headless=self.headless,
+                browser_type=self.browser_type,
+                proxy=self.proxy,
+            ) as browser:
+                while to_visit and len(visited) < max_pages:
+                    url, depth = to_visit.popleft()
 
-                if url in visited:
-                    continue
-
-                if depth > max_depth:
-                    continue
-
-                # Check domain restriction
-                if same_domain_only:
-                    if urlparse(url).netloc != start_domain:
+                    if url in visited or depth > max_depth:
                         continue
 
-                # Check if we can scrape
-                can_scrape = await self.ethical_scraper.can_scrape(url)
-                if not can_scrape:
-                    logger.warning(f"Skipping {url} - blocked by ethical rules")
-                    continue
+                    # Check domain restriction
+                    if same_domain_only and urlparse(url).netloc != start_domain:
+                        continue
 
-                logger.info(f"Crawling ({depth}/{max_depth}): {url}")
+                    # Check if we can scrape
+                    can_scrape = await self.ethical_scraper.can_scrape(url)
+                    if not can_scrape:
+                        logger.warning(f"Skipping {url} - blocked by ethical rules")
+                        continue
 
-                try:
-                    # Navigate and extract
-                    await browser.navigate(url)
-                    html = await browser.get_content()
+                    logger.info(f"Crawling ({depth}/{max_depth}): {url}")
+                    visited.add(url)
 
-                    # Extract data
-                    if extractor_type == "product":
-                        extracted_data = self.extractor.extract_product_info(html)
-                    elif extractor_type == "article":
-                        extracted_data = self.extractor.extract_article_info(html)
-                    else:
-                        extracted_data = self.extractor.extract_from_html(html)
+                    try:
+                        # Navigate and extract
+                        response = await browser.navigate(url)
+                        if response is not None and response.status >= 400:
+                            logger.warning(f"Skipping {url} - HTTP {response.status}")
+                            continue
 
-                    if extracted_data:
-                        extracted_data["url"] = url
-                        extracted_data["depth"] = depth
-                        results.append(extracted_data)
+                        html = await browser.get_content()
+                        extracted_data = self._extract(html, extractor_type)
 
-                        # Save to database if requested
-                        if save_to_db:
-                            db = DatabaseManager()
-                            try:
+                        if extracted_data:
+                            extracted_data["url"] = url
+                            extracted_data["depth"] = depth
+                            results.append(extracted_data)
+
+                            if db is not None:
                                 db.save(collection, extracted_data)
-                            finally:
-                                db.close()
 
-                    # Extract links for further crawling
-                    if depth < max_depth:
-                        links = await browser.extract_links()
-                        for link in links:
-                            # Normalize URL
-                            absolute_url = urljoin(url, link)
+                        # Extract links for further crawling
+                        if depth < max_depth:
+                            for link in await browser.extract_links():
+                                absolute_url = self._normalize_link(url, link)
+                                if absolute_url and absolute_url not in seen:
+                                    seen.add(absolute_url)
+                                    to_visit.append((absolute_url, depth + 1))
 
-                            if absolute_url not in visited and absolute_url not in [u for u, _ in to_visit]:
-                                to_visit.append((absolute_url, depth + 1))
-
-                    visited.add(url)
-
-                except Exception as e:
-                    logger.error(f"Error crawling {url}: {e}")
-                    visited.add(url)
+                    except Exception as e:
+                        logger.error(f"Error crawling {url}: {e}")
+        finally:
+            if db is not None:
+                db.close()
 
         logger.info(f"Crawling completed. Visited {len(visited)} pages, extracted {len(results)} items")
         return results
 
+    @staticmethod
+    def _normalize_link(base_url: str, link: str) -> Optional[str]:
+        """Resolve a link against base_url, dropping fragments and non-HTTP schemes"""
+        absolute_url, _ = urldefrag(urljoin(base_url, link))
+        if urlparse(absolute_url).scheme not in ("http", "https"):
+            return None
+        return absolute_url
+
     def _sanitize_filename(self, url: str) -> str:
         """Sanitize URL for use as filename"""
-        import re
-        from urllib.parse import urlparse
-
         parsed = urlparse(url)
         filename = f"{parsed.netloc}{parsed.path}".replace("/", "_")
         filename = re.sub(r'[^\w\-_.]', '_', filename)

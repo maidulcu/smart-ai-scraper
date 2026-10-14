@@ -8,6 +8,26 @@ from loguru import logger
 
 from .celery_app import celery_app
 from ..core.scraper import SmartScraper
+from ..storage.database import DatabaseManager
+
+
+def _run(coro):
+    """Run a coroutine to completion on a fresh event loop (Celery tasks are sync)"""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _parse_price(value: Any) -> Optional[float]:
+    """Convert a scraped price (str or number) to float, or None if not numeric"""
+    if value is None:
+        return None
+    try:
+        return float(str(value).replace(",", ""))
+    except ValueError:
+        return None
 
 
 @celery_app.task(bind=True, name="smart_ai_scraper.tasks.scraping_tasks.scrape_url")
@@ -39,20 +59,15 @@ def scrape_url(
         scraper = SmartScraper()
 
         # Run async scrape in sync context
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(
-                scraper.scrape(
-                    url=url,
-                    extractor_type=extractor_type,
-                    save_to_db=save_to_db,
-                    collection=collection,
-                    **kwargs
-                )
+        result = _run(
+            scraper.scrape(
+                url=url,
+                extractor_type=extractor_type,
+                save_to_db=save_to_db,
+                collection=collection,
+                **kwargs
             )
-        finally:
-            loop.close()
+        )
 
         logger.info(f"Task {self.request.id}: Successfully scraped {url}")
         return result
@@ -84,33 +99,28 @@ def scrape_urls_batch(
     Returns:
         List of scraped data dictionaries
     """
-    results = []
+    # One scraper for the whole batch so rate limits and crawl delays apply
+    # across URLs instead of being reset for each one
+    scraper = SmartScraper()
 
-    for i, url in enumerate(urls):
-        try:
-            logger.info(f"Task {self.request.id}: Scraping {i+1}/{len(urls)}: {url}")
-
-            scraper = SmartScraper()
-
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+    async def run_batch() -> List[Dict[str, Any]]:
+        results = []
+        for i, url in enumerate(urls):
             try:
-                result = loop.run_until_complete(
-                    scraper.scrape(
-                        url=url,
-                        extractor_type=extractor_type,
-                        save_to_db=save_to_db,
-                        collection=collection,
-                        **kwargs
-                    )
-                )
-                results.append(result)
-            finally:
-                loop.close()
+                logger.info(f"Task {self.request.id}: Scraping {i+1}/{len(urls)}: {url}")
+                results.append(await scraper.scrape(
+                    url=url,
+                    extractor_type=extractor_type,
+                    save_to_db=save_to_db,
+                    collection=collection,
+                    **kwargs
+                ))
+            except Exception as e:
+                logger.error(f"Task {self.request.id}: Error scraping {url}: {e}")
+                results.append({"url": url, "error": str(e), "success": False})
+        return results
 
-        except Exception as e:
-            logger.error(f"Task {self.request.id}: Error scraping {url}: {e}")
-            results.append({"url": url, "error": str(e)})
+    results = _run(run_batch())
 
     logger.info(f"Task {self.request.id}: Completed batch of {len(urls)} URLs")
     return results
@@ -128,46 +138,39 @@ def monitor_price(
     Args:
         url: Product URL to monitor
         collection: Database collection name
-        threshold: Price change threshold for alerts
+        threshold: Price change threshold (percent) for alerts
 
     Returns:
         Price monitoring result
     """
     try:
+        # Look up the most recent observation *before* saving the new one,
+        # otherwise we'd compare the new price against itself (or the oldest)
+        with DatabaseManager() as db:
+            previous_records = db.find(collection, {"url": url}, limit=1, newest_first=True)
+        previous = previous_records[0] if previous_records else None
+
         scraper = SmartScraper()
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(
-                scraper.scrape(
-                    url=url,
-                    extractor_type="product",
-                    save_to_db=True,
-                    collection=collection,
-                )
+        result = _run(
+            scraper.scrape(
+                url=url,
+                extractor_type="product",
+                save_to_db=True,
+                collection=collection,
             )
-        finally:
-            loop.close()
+        )
 
-        # Check price change if threshold provided
-        if threshold and result.get("price"):
-            from ..storage.database import DatabaseManager
+        old_price = _parse_price(previous.get("price")) if previous else None
+        new_price = _parse_price(result.get("price"))
 
-            db = DatabaseManager()
-            previous = db.find_one(collection, {"url": url})
-
-            if previous and previous.get("price"):
-                old_price = float(previous["price"])
-                new_price = float(result["price"])
-                change_percent = ((new_price - old_price) / old_price) * 100
-
-                result["price_change"] = change_percent
+        if old_price and new_price is not None:
+            change_percent = ((new_price - old_price) / old_price) * 100
+            result["previous_price"] = old_price
+            result["price_change"] = change_percent
+            if threshold is not None:
                 result["price_alert"] = abs(change_percent) >= threshold
 
-                logger.info(f"Price change for {url}: {change_percent:.2f}%")
-
-            db.close()
+            logger.info(f"Price change for {url}: {change_percent:.2f}%")
 
         return result
 

@@ -15,7 +15,7 @@ This guide provides detailed installation instructions for Smart AI Scraper on d
 
 ### System Requirements
 
-- Python 3.8 or higher
+- Python 3.9 or higher
 - 4GB RAM minimum (8GB recommended)
 - 2GB free disk space
 - Internet connection
@@ -31,7 +31,7 @@ This guide provides detailed installation instructions for Smart AI Scraper on d
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/smart-ai-scraper.git
+git clone https://github.com/maidulcu/smart-ai-scraper.git
 cd smart-ai-scraper
 
 # Install dependencies
@@ -85,7 +85,7 @@ sudo systemctl start mongod
 sudo systemctl enable mongod
 
 # Clone and install Smart AI Scraper
-git clone https://github.com/yourusername/smart-ai-scraper.git
+git clone https://github.com/maidulcu/smart-ai-scraper.git
 cd smart-ai-scraper
 python3 -m venv venv
 source venv/bin/activate
@@ -121,7 +121,7 @@ brew install mongodb-community
 brew services start mongodb-community
 
 # Clone and install Smart AI Scraper
-git clone https://github.com/yourusername/smart-ai-scraper.git
+git clone https://github.com/maidulcu/smart-ai-scraper.git
 cd smart-ai-scraper
 python3 -m venv venv
 source venv/bin/activate
@@ -155,7 +155,7 @@ smart-scraper setup
 4. **Install Smart AI Scraper**
    ```powershell
    # Clone repository
-   git clone https://github.com/yourusername/smart-ai-scraper.git
+   git clone https://github.com/maidulcu/smart-ai-scraper.git
    cd smart-ai-scraper
 
    # Create virtual environment
@@ -343,7 +343,7 @@ pip install --force-reinstall -r requirements.txt
 
 # Check Python version
 python --version
-# Should be 3.8 or higher
+# Should be 3.9 or higher
 ```
 
 ### Permission Errors (Linux/macOS)
@@ -394,7 +394,7 @@ rm -rf venv
 - [README.md](README.md) - Main documentation
 - [CONTRIBUTING.md](CONTRIBUTING.md) - Contribution guidelines
 - [Examples](examples/) - Usage examples
-- [GitHub Issues](https://github.com/yourusername/smart-ai-scraper/issues) - Support
+- [GitHub Issues](https://github.com/maidulcu/smart-ai-scraper/issues) - Support
 
 ## Next Steps
 

@@ -4,6 +4,8 @@ Command-line interface for Smart AI Scraper
 
 import asyncio
 import json
+import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -13,6 +15,7 @@ from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from loguru import logger
 
+from . import __version__
 from .core.scraper import SmartScraper
 from .core.config import settings
 from .storage.database import DatabaseManager
@@ -21,7 +24,7 @@ console = Console()
 
 
 @click.group()
-@click.version_option(version="0.1.0")
+@click.version_option(version=__version__)
 def cli():
     """Smart AI Scraper - AI-powered web scraping tool"""
     pass
@@ -127,7 +130,7 @@ def scrape_multiple(urls: tuple, type: str, save: bool, collection: str, concurr
 
         for result in results:
             status = "✓" if result.get("success") else "✗"
-            title = result.get("title", result.get("name", "N/A"))[:50]
+            title = str(result.get("title") or result.get("name") or "N/A")[:50]
             table.add_row(result["url"][:60], status, title)
 
         console.print(table)
@@ -151,7 +154,9 @@ def scrape_multiple(urls: tuple, type: str, save: bool, collection: str, concurr
 @click.option("--type", "-t", type=click.Choice(["general", "product", "article"]), default="general")
 @click.option("--save/--no-save", default=True, help="Save results to database")
 @click.option("--collection", "-c", default="scraped_data")
-def crawl(start_url: str, depth: int, max_pages: int, same_domain: bool, type: str, save: bool, collection: str):
+@click.option("--output", "-o", type=click.Path(), help="Save output to JSON file")
+def crawl(start_url: str, depth: int, max_pages: int, same_domain: bool, type: str, save: bool, collection: str,
+          output: Optional[str]):
     """Crawl a website starting from a URL"""
 
     async def run():
@@ -180,6 +185,11 @@ def crawl(start_url: str, depth: int, max_pages: int, same_domain: bool, type: s
 
         console.print(f"\n[green]Crawl completed: {len(results)} pages scraped[/green]")
 
+        if output:
+            with open(output, "w") as f:
+                json.dump(results, f, indent=2, default=str)
+            console.print(f"\n[green]Saved to {output}[/green]")
+
         return results
 
     asyncio.run(run())
@@ -191,8 +201,8 @@ def crawl(start_url: str, depth: int, max_pages: int, same_domain: bool, type: s
 def query(collection: str, limit: int):
     """Query scraped data from database"""
     try:
-        db = DatabaseManager()
-        results = db.find(collection, {})[:limit]
+        with DatabaseManager() as db:
+            results = db.find(collection, {}, limit=limit, newest_first=True)
 
         if not results:
             console.print(f"[yellow]No data found in collection '{collection}'[/yellow]")
@@ -207,35 +217,39 @@ def query(collection: str, limit: int):
 
         for result in results:
             row_id = result.get("_id", result.get("id", "N/A"))
-            url = result.get("url", "N/A")[:50]
-            title = result.get("title", result.get("name", "N/A"))[:40]
+            url = str(result.get("url") or "N/A")[:50]
+            title = str(result.get("title") or result.get("name") or "N/A")[:40]
             created = str(result.get("created_at", "N/A"))[:19]
             table.add_row(str(row_id), url, title, created)
 
         console.print(table)
-        console.print(f"\nShowing {len(results)} of total records")
-
-        db.close()
+        console.print(f"\nShowing the {len(results)} most recent records")
 
     except Exception as e:
         console.print(f"[red]Error querying database: {e}[/red]")
 
 
 @cli.command()
-def worker():
+@click.option("--queues", "-Q", default="scraping,celery", show_default=True,
+              help="Comma-separated queues to consume (scrape tasks are routed to 'scraping')")
+@click.option("--concurrency", type=int, help="Number of worker processes")
+def worker(queues: str, concurrency: Optional[int]):
     """Start Celery worker for distributed scraping"""
-    import subprocess
-
     console.print("[yellow]Starting Celery worker...[/yellow]")
     console.print("Press Ctrl+C to stop\n")
 
+    command = [
+        sys.executable, "-m", "celery",
+        "-A", "smart_ai_scraper.tasks.celery_app",
+        "worker",
+        "--loglevel=info",
+        "-Q", queues,
+    ]
+    if concurrency:
+        command += ["--concurrency", str(concurrency)]
+
     try:
-        subprocess.run([
-            "celery",
-            "-A", "smart_ai_scraper.tasks.celery_app",
-            "worker",
-            "--loglevel=info"
-        ])
+        subprocess.run(command)
     except KeyboardInterrupt:
         console.print("\n[yellow]Worker stopped[/yellow]")
 
@@ -321,9 +335,8 @@ POSTGRES_DB={pg_db}
     # Download spaCy model
     console.print("\n[bold]Downloading spaCy model...[/bold]")
     if click.confirm("Download en_core_web_sm model?", default=True):
-        import subprocess
         try:
-            subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"])
+            subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_sm"], check=True)
             console.print("[green]✓ spaCy model downloaded[/green]")
         except Exception as e:
             console.print(f"[red]Error downloading spaCy model: {e}[/red]")
@@ -331,9 +344,8 @@ POSTGRES_DB={pg_db}
     # Install Playwright browsers
     console.print("\n[bold]Installing Playwright browsers...[/bold]")
     if click.confirm("Install Playwright browsers?", default=True):
-        import subprocess
         try:
-            subprocess.run(["playwright", "install", "chromium"])
+            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
             console.print("[green]✓ Playwright browsers installed[/green]")
         except Exception as e:
             console.print(f"[red]Error installing Playwright: {e}[/red]")
@@ -345,6 +357,7 @@ POSTGRES_DB={pg_db}
 def main():
     """Main entry point"""
     # Configure logger
+    settings.storage.ensure_directories()
     logger.remove()
     logger.add(
         Path(settings.storage.logs_dir) / "scraper.log",

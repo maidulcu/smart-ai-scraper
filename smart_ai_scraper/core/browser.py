@@ -5,7 +5,7 @@ Browser manager using Playwright with anti-bot features
 import asyncio
 import random
 from typing import Optional, Dict, Any, List
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright, Response
 from fake_useragent import UserAgent
 from loguru import logger
 
@@ -23,7 +23,7 @@ class BrowserManager:
     ):
         self.headless = headless if headless is not None else settings.browser.headless
         self.browser_type = browser_type or settings.browser.browser_type
-        self.proxy = proxy
+        self.proxy = proxy or self._pick_configured_proxy()
 
         self.playwright: Optional[Playwright] = None
         self.browser: Optional[Browser] = None
@@ -58,15 +58,13 @@ class BrowserManager:
             raise ValueError(f"Unsupported browser type: {self.browser_type}")
 
         # Browser launch options
-        launch_options = {
-            "headless": self.headless,
-            "args": [
+        launch_options: Dict[str, Any] = {"headless": self.headless}
+        if self.browser_type == "chromium":
+            # Chromium-only flags; Firefox and WebKit don't understand them
+            launch_options["args"] = [
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-            ],
-        }
+            ]
 
         # Add proxy if configured
         if self.proxy:
@@ -139,7 +137,7 @@ class BrowserManager:
 
         logger.info("Browser closed")
 
-    async def navigate(self, url: str, wait_until: str = "networkidle") -> Page:
+    async def navigate(self, url: str, wait_until: str = "networkidle") -> Optional[Response]:
         """
         Navigate to a URL with human-like behavior
 
@@ -148,7 +146,8 @@ class BrowserManager:
             wait_until: When to consider navigation succeeded (load, domcontentloaded, networkidle)
 
         Returns:
-            Page object
+            The main resource response (use .status to check for HTTP errors),
+            or None for navigations that don't produce one
         """
         if not self.page:
             raise RuntimeError("Browser not started. Call start() first.")
@@ -157,13 +156,12 @@ class BrowserManager:
         await self._random_delay()
 
         logger.info(f"Navigating to {url}")
-        await self.page.goto(url, wait_until=wait_until)
+        response = await self.page.goto(url, wait_until=wait_until)
 
         # Random mouse movements to simulate human behavior
-        if settings.anti_bot.user_agent_rotation:
-            await self._simulate_human_behavior()
+        await self._simulate_human_behavior()
 
-        return self.page
+        return response
 
     async def get_content(self) -> str:
         """Get page content"""
@@ -243,6 +241,17 @@ class BrowserManager:
         except Exception as e:
             logger.debug(f"Could not simulate human behavior: {e}")
 
+    @staticmethod
+    def _pick_configured_proxy() -> Optional[str]:
+        """Pick a random proxy from PROXY_LIST when PROXY_ENABLED is set"""
+        if not settings.anti_bot.proxy_enabled:
+            return None
+        proxies = settings.anti_bot.get_proxy_list()
+        if not proxies:
+            logger.warning("PROXY_ENABLED is true but PROXY_LIST is empty")
+            return None
+        return random.choice(proxies)
+
     def _get_random_user_agent(self) -> str:
         """Get a random user agent"""
         return self.ua.random
@@ -252,12 +261,11 @@ class BrowserManager:
         if not self.page:
             raise RuntimeError("Browser not started. Call start() first.")
 
-        links = await self.page.evaluate(f"""
-            () => {{
-                const anchors = Array.from(document.querySelectorAll('{selector}'));
-                return anchors.map(a => a.href).filter(href => href);
-            }}
-        """)
+        # Pass the selector as data rather than formatting it into the script
+        links = await self.page.eval_on_selector_all(
+            selector or "a",
+            "elements => elements.map(el => el.href).filter(href => href)",
+        )
 
         return links
 

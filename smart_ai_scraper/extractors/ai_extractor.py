@@ -2,8 +2,9 @@
 AI-powered data extraction using NLP
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Iterator
 from bs4 import BeautifulSoup
+import json
 import re
 from loguru import logger
 
@@ -16,13 +17,20 @@ except ImportError:
     logger.warning("spaCy not available. Install with: python -m spacy download en_core_web_sm")
 
 try:
-    from transformers import pipeline, AutoTokenizer, AutoModelForTokenClassification
+    from transformers import pipeline
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
     logger.warning("Transformers not available. Install with: pip install transformers")
 
 from ..core.config import settings
+
+# spaCy refuses texts longer than nlp.max_length (1,000,000 chars by default),
+# and transformer pipelines are slow on long inputs, so cap what we send to NER.
+MAX_NER_TEXT_LENGTH = 100_000
+
+PRICE_PATTERN = re.compile(r"\d[\d,]*(?:\.\d+)?")
+CURRENCY_PATTERN = re.compile(r"[£$€¥₹]")
 
 
 class AIExtractor:
@@ -70,6 +78,8 @@ class AIExtractor:
         Returns:
             List of entities with type and text
         """
+        text = text[:MAX_NER_TEXT_LENGTH]
+
         if self.use_transformers and self.ner_pipeline:
             return self._extract_entities_transformers(text)
         elif self.nlp:
@@ -121,6 +131,10 @@ class AIExtractor:
         """
         soup = BeautifulSoup(html, "lxml")
 
+        # Structured data lives in <script> tags, so read it before stripping them
+        structured_data = self._extract_structured_data(soup)
+        title = soup.title.get_text(strip=True) if soup.title else None
+
         # Remove script and style elements
         for script in soup(["script", "style", "noscript"]):
             script.decompose()
@@ -137,15 +151,12 @@ class AIExtractor:
         # Extract entities
         entities = self.extract_entities(text)
 
-        # Extract structured data
-        structured_data = self._extract_structured_data(soup)
-
         return {
             "text": text,
             "metadata": metadata,
             "entities": entities,
             "structured_data": structured_data,
-            "title": soup.title.string if soup.title else None,
+            "title": title,
         }
 
     def _extract_metadata(self, soup: BeautifulSoup) -> Dict[str, str]:
@@ -180,18 +191,73 @@ class AIExtractor:
         structured = []
 
         # JSON-LD
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                import json
-                data = json.loads(script.string)
-                structured.append({
-                    "type": "json-ld",
-                    "data": data,
-                })
-            except Exception as e:
-                logger.debug(f"Could not parse JSON-LD: {e}")
+        for data in self._load_json_ld(soup):
+            structured.append({
+                "type": "json-ld",
+                "data": data,
+            })
 
         return structured
+
+    @staticmethod
+    def _load_json_ld(soup: BeautifulSoup) -> List[Any]:
+        """Parse every JSON-LD <script> block, skipping malformed ones"""
+        blocks = []
+        for script in soup.find_all("script", type="application/ld+json"):
+            raw = script.string or script.get_text()
+            if not raw or not raw.strip():
+                continue
+            try:
+                blocks.append(json.loads(raw))
+            except ValueError as e:
+                logger.debug(f"Could not parse JSON-LD: {e}")
+        return blocks
+
+    @classmethod
+    def _iter_json_ld_nodes(cls, data: Any) -> Iterator[Dict[str, Any]]:
+        """Yield every JSON-LD object, flattening top-level lists and @graph"""
+        if isinstance(data, list):
+            for item in data:
+                yield from cls._iter_json_ld_nodes(item)
+        elif isinstance(data, dict):
+            yield data
+            if "@graph" in data:
+                yield from cls._iter_json_ld_nodes(data["@graph"])
+
+    @staticmethod
+    def _has_type(node: Dict[str, Any], *types: str) -> bool:
+        """Check a JSON-LD node's @type, which may be a string or a list"""
+        node_type = node.get("@type")
+        if isinstance(node_type, list):
+            return any(t in types for t in node_type)
+        return node_type in types
+
+    @staticmethod
+    def _first(value: Any) -> Any:
+        """Return the first element of a list, or the value itself"""
+        if isinstance(value, list):
+            return value[0] if value else None
+        return value
+
+    @classmethod
+    def _name_of(cls, value: Any) -> Optional[str]:
+        """Read a name from a JSON-LD value that may be a string, object or list"""
+        value = cls._first(value)
+        if isinstance(value, dict):
+            return value.get("name")
+        if isinstance(value, str):
+            return value
+        return None
+
+    @classmethod
+    def _url_of(cls, value: Any) -> Optional[str]:
+        """Read a URL from a JSON-LD image value (string, ImageObject or list)"""
+        value = cls._first(value)
+        if isinstance(value, dict):
+            return value.get("url") or value.get("contentUrl")
+        if isinstance(value, str):
+            return value
+        return None
 
     def extract_product_info(self, html: str) -> Optional[Dict[str, Any]]:
         """
@@ -217,30 +283,30 @@ class AIExtractor:
         }
 
         # Try to extract from structured data first
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                import json
-                data = json.loads(script.string)
+        for block in self._load_json_ld(soup):
+            for node in self._iter_json_ld_nodes(block):
+                if not self._has_type(node, "Product"):
+                    continue
 
-                if isinstance(data, dict):
-                    if data.get("@type") == "Product":
-                        product_info["name"] = data.get("name")
-                        product_info["description"] = data.get("description")
-                        product_info["image"] = data.get("image")
-                        product_info["brand"] = data.get("brand", {}).get("name")
+                product_info["name"] = node.get("name")
+                product_info["description"] = node.get("description")
+                product_info["image"] = self._url_of(node.get("image"))
+                product_info["brand"] = self._name_of(node.get("brand"))
 
-                        offers = data.get("offers", {})
-                        if isinstance(offers, dict):
-                            product_info["price"] = offers.get("price")
-                            product_info["currency"] = offers.get("priceCurrency")
-                            product_info["availability"] = offers.get("availability")
+                offers = self._first(node.get("offers"))
+                if isinstance(offers, dict):
+                    # AggregateOffer uses lowPrice instead of price
+                    price = offers.get("price", offers.get("lowPrice"))
+                    product_info["price"] = str(price) if price is not None else None
+                    product_info["currency"] = offers.get("priceCurrency")
+                    product_info["availability"] = offers.get("availability")
 
-                        rating = data.get("aggregateRating", {})
-                        if rating:
-                            product_info["rating"] = rating.get("ratingValue")
-
-            except Exception as e:
-                logger.debug(f"Could not parse product JSON-LD: {e}")
+                rating = node.get("aggregateRating")
+                if isinstance(rating, dict):
+                    product_info["rating"] = rating.get("ratingValue")
+                break
+            if product_info["name"]:
+                break
 
         # Fallback: try to extract from common selectors
         if not product_info["name"]:
@@ -262,14 +328,14 @@ class AIExtractor:
                 element = soup.select_one(selector)
                 if element:
                     price_text = element.get_text(strip=True)
-                    # Extract numeric price
-                    price_match = re.search(r'[\d,]+\.?\d*', price_text)
-                    if price_match:
-                        product_info["price"] = price_match.group().replace(',', '')
-                    # Extract currency
-                    currency_match = re.search(r'[£$€¥]', price_text)
-                    if currency_match:
-                        product_info["currency"] = currency_match.group()
+                    price_match = PRICE_PATTERN.search(price_text)
+                    if not price_match:
+                        continue
+                    product_info["price"] = price_match.group().replace(',', '')
+                    if not product_info["currency"]:
+                        currency_match = CURRENCY_PATTERN.search(price_text)
+                        if currency_match:
+                            product_info["currency"] = currency_match.group()
                     break
 
         return product_info if any(product_info.values()) else None
@@ -298,27 +364,20 @@ class AIExtractor:
         }
 
         # Try structured data first
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                import json
-                data = json.loads(script.string)
+        for block in self._load_json_ld(soup):
+            for node in self._iter_json_ld_nodes(block):
+                if not self._has_type(node, "Article", "NewsArticle", "BlogPosting"):
+                    continue
 
-                if isinstance(data, dict):
-                    if data.get("@type") in ["Article", "NewsArticle", "BlogPosting"]:
-                        article_info["title"] = data.get("headline")
-                        article_info["description"] = data.get("description")
-                        article_info["published_date"] = data.get("datePublished")
-                        article_info["modified_date"] = data.get("dateModified")
-                        article_info["image"] = data.get("image")
-
-                        author = data.get("author", {})
-                        if isinstance(author, dict):
-                            article_info["author"] = author.get("name")
-                        elif isinstance(author, list) and author:
-                            article_info["author"] = author[0].get("name")
-
-            except Exception as e:
-                logger.debug(f"Could not parse article JSON-LD: {e}")
+                article_info["title"] = node.get("headline")
+                article_info["description"] = node.get("description")
+                article_info["published_date"] = node.get("datePublished")
+                article_info["modified_date"] = node.get("dateModified")
+                article_info["image"] = self._url_of(node.get("image"))
+                article_info["author"] = self._name_of(node.get("author"))
+                break
+            if article_info["title"]:
+                break
 
         # Fallback: extract from common selectors
         if not article_info["title"]:
@@ -342,10 +401,10 @@ class AIExtractor:
             if article_info["content"]:
                 entities = self.extract_entities(article_info["content"])
                 # Extract people and organizations as potential tags
-                article_info["tags"] = [
+                article_info["tags"] = list(dict.fromkeys(
                     e["text"] for e in entities
                     if e["label"] in ["PERSON", "ORG", "GPE"]
-                ]
+                ))
 
         return article_info if any(article_info.values()) else None
 

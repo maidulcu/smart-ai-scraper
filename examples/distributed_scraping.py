@@ -6,7 +6,7 @@ across multiple workers for scalability.
 
 Prerequisites:
 1. Install and start Redis: redis-server
-2. Start Celery worker: celery -A smart_ai_scraper.tasks.celery_app worker --loglevel=info
+2. Start Celery worker: celery -A smart_ai_scraper.tasks.celery_app worker -Q scraping,celery --loglevel=info
 """
 
 from smart_ai_scraper.tasks.scraping_tasks import scrape_url, scrape_urls_batch, monitor_price
@@ -132,7 +132,7 @@ def main():
 
     print("\n" + "=" * 50)
     print("Note: Make sure Redis is running and Celery worker is started")
-    print("Start worker: celery -A smart_ai_scraper.tasks.celery_app worker --loglevel=info")
+    print("Start worker: celery -A smart_ai_scraper.tasks.celery_app worker -Q scraping,celery --loglevel=info")
 
 
 if __name__ == "__main__":

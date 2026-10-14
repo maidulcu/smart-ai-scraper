@@ -2,7 +2,8 @@
 Configuration management using Pydantic settings
 """
 
-from typing import Optional, List
+from typing import Optional, List, Literal
+from urllib.parse import quote_plus
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
@@ -27,7 +28,9 @@ class BrowserSettings(BaseSettings):
     """Browser configuration"""
 
     headless: bool = Field(default=True, description="Run browser in headless mode")
-    browser_type: str = Field(default="chromium", description="Browser type (chromium, firefox, webkit)")
+    browser_type: Literal["chromium", "firefox", "webkit"] = Field(
+        default="chromium", description="Browser type (chromium, firefox, webkit)"
+    )
     timeout: int = Field(default=30000, description="Default timeout in milliseconds")
     viewport_width: int = Field(default=1920, description="Viewport width")
     viewport_height: int = Field(default=1080, description="Viewport height")
@@ -95,7 +98,9 @@ class CelerySettings(BaseSettings):
 class DatabaseSettings(BaseSettings):
     """Database configuration"""
 
-    database_type: str = Field(default="mongodb", description="Database type (mongodb or postgres)")
+    database_type: Literal["mongodb", "postgres"] = Field(
+        default="mongodb", description="Database type (mongodb or postgres)"
+    )
 
     # MongoDB settings
     mongodb_uri: str = Field(default="mongodb://localhost:27017/", description="MongoDB URI")
@@ -117,7 +122,9 @@ class DatabaseSettings(BaseSettings):
 
     def get_postgres_url(self) -> str:
         """Get PostgreSQL connection URL"""
-        return f"postgresql://{self.postgres_user}:{self.postgres_password}@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        user = quote_plus(self.postgres_user)
+        password = quote_plus(self.postgres_password)
+        return f"postgresql://{user}:{password}@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
 
 
 class AISettings(BaseSettings):
@@ -184,9 +191,6 @@ class Settings:
         self.ai = AISettings()
         self.ethical = EthicalScrapingSettings()
         self.storage = StorageSettings()
-
-        # Ensure storage directories exist
-        self.storage.ensure_directories()
 
 
 # Global settings instance
